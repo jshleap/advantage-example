@@ -1,89 +1,147 @@
-from os.path import join, dirname
-import datetime
+import sys
+from os.path import dirname
+from os.path import join, abspath
 
+import numpy as np
 import pandas as pd
-from scipy.signal import savgol_filter
-
+from bokeh.core.properties import value
 from bokeh.io import curdoc
-from bokeh.layouts import row, column
-from bokeh.models import ColumnDataSource, DataRange1d, Select
-from bokeh.palettes import Blues4
+from bokeh.layouts import column, row
+from bokeh.models import ColumnDataSource, CustomJS
+from bokeh.models.widgets import Slider, Button, DataTable, TableColumn, \
+    NumberFormatter, Div
 from bokeh.plotting import figure
+from bokeh.transform import dodge
 
-STATISTICS = ['record_min_temp', 'actual_min_temp', 'average_min_temp', 'average_max_temp', 'actual_max_temp', 'record_max_temp']
+sys.path.append(dirname(__file__))
+from knapsack import Knapsack
 
-def get_dataset(src, name, distribution):
-    df = src[src.airport == name].copy()
-    del df['airport']
-    df['date'] = pd.to_datetime(df.date)
-    # timedelta here instead of pd.DateOffset to avoid pandas bug < 0.18 (Pandas issue #11925)
-    df['left'] = df.date - datetime.timedelta(days=0.5)
-    df['right'] = df.date + datetime.timedelta(days=0.5)
-    df = df.set_index(['date'])
-    df.sort_index(inplace=True)
-    if distribution == 'Smoothed':
-        window, order = 51, 3
-        for key in STATISTICS:
-            df[key] = savgol_filter(df[key], window, order)
+# Constants -------------------------------------------------------------------
+cols = ['Keyword', 'daily_impressions_average', 'daily_clicks_average',
+        'ad_position_average', 'cpc_average', 'daily_cost_average', 'source']
+metric = cols[1:-1]
 
-    return ColumnDataSource(data=df)
+# Path to files
+path = abspath(join(dirname(__file__), 'tmp'))
+# read output of scraping and stats
+full = pd.read_csv(join(path, 'jshleap_stats.csv'), usecols=cols)
+df = full.dropna()
+nan_idx = df.index
+nan_df = full[~full.index.isin(nan_idx)]
+minimum = min(df.daily_cost_average[df.daily_cost_average > 0])
+first_budget = max(minimum, 0.1)
+maximum = min(400, max(df.daily_cost_average))
+choice = ['GKP', 'Optimized']
 
-def make_plot(source, title):
-    plot = figure(x_axis_type="datetime", plot_width=800, tools="", toolbar_location=None)
-    plot.title.text = title
 
-    plot.quad(top='record_max_temp', bottom='record_min_temp', left='left', right='right',
-              color=Blues4[2], source=source, legend="Record")
-    plot.quad(top='average_max_temp', bottom='average_min_temp', left='left', right='right',
-              color=Blues4[1], source=source, legend="Average")
-    plot.quad(top='actual_max_temp', bottom='actual_min_temp', left='left', right='right',
-              color=Blues4[0], alpha=0.5, line_color="black", source=source, legend="Actual")
+# Functions ###################################################################
+def optimize_values(data_frame, capacity):
+    cost = data_frame.daily_cost_average.copy(deep=True)
+    cost[cost == 0] = minimum / 10
+    values = (data_frame.daily_impressions_average +
+              data_frame.daily_clicks_average) * (1 / cost)
+    opt = Knapsack(items_names=data_frame.Keyword.to_list(),
+                       values=values.to_list(), capacity=capacity,
+                       weights=data_frame.daily_cost_average.tolist(),
+                       solve_type=5, name='Branch_n_bound')
+    opt.get_results(print_it=True)
+    return data_frame[data_frame.Keyword.isin(opt.packed_items)]
 
-    # fixed attributes
-    plot.xaxis.axis_label = None
-    plot.yaxis.axis_label = "Temperature (F)"
-    plot.axis.axis_label_text_font_style = "bold"
-    plot.x_range = DataRange1d(range_padding=0.0)
-    plot.grid.grid_line_alpha = 0.3
 
-    return plot
+def set_table_source(dataframe):
+    data = {'Keyword': dataframe.Keyword,
+            'ad_position_average': dataframe.ad_position_average,
+            'cpc_average': dataframe.cpc_average,
+            'daily_clicks_average': dataframe.daily_clicks_average,
+            'daily_cost_average': dataframe.daily_cost_average,
+            'daily_impressions_average': dataframe.daily_impressions_average,
+            'source': dataframe.source}
+    source = ColumnDataSource(data=data)
+    return data, source
 
-def update_plot(attrname, old, new):
-    city = city_select.value
-    plot.title.text = "Weather data for " + cities[city]['title']
 
-    src = get_dataset(df, cities[city]['airport'], distribution_select.value)
-    source.data.update(src.data)
+# Body of app #################################################################
+data, source = set_table_source(df)
 
-city = 'Austin'
-distribution = 'Discrete'
+data_missing, source_missing = set_table_source(nan_df)
+current = optimize_values(df, first_budget)
+gkp = optimize_values(df[df.source == 'GKP'], first_budget)
+random = df.sample(current.shape[0])
+relabel = ['Daily impressions', 'Daily Clicks', 'Ad Pos', 'CPC', 'Daily Cost']
+bar_data = {'metric': relabel,
+            choice[0]: np.log([gkp[x].sum() for x in metric]),
+            choice[1]: np.log([current[x].sum() for x in metric])}
 
-cities = {
-    'Austin': {
-        'airport': 'AUS',
-        'title': 'Austin, TX',
-    },
-    'Boston': {
-        'airport': 'BOS',
-        'title': 'Boston, MA',
-    },
-    'Seattle': {
-        'airport': 'SEA',
-        'title': 'Seattle, WA',
-    }
-}
+bar_source = ColumnDataSource(data=bar_data)
 
-city_select = Select(value=city, title='City', options=sorted(cities.keys()))
-distribution_select = Select(value=distribution, title='Distribution', options=['Discrete', 'Smoothed'])
+p = figure(x_range=relabel, y_range=(-5, 15), plot_height=325,
+           toolbar_location=None, tools="",
+           title='Relative Value change for baskets of words')
+p.vbar(x=dodge('metric', -0.25, range=p.x_range), top=choice[0], width=0.2,
+       source=bar_source, color="#c9d9d3", legend=value(choice[0]))
+p.vbar(x=dodge('metric', 0.25, range=p.x_range), top=choice[1], width=0.2,
+       source=bar_source, color="#e84d60", legend=value(choice[1]))
+p.x_range.range_padding = 0.1
+p.xgrid.grid_line_color = None
+p.legend.location = "top_left"
+p.legend.orientation = "horizontal"
+p.yaxis.axis_label_text_font_size = '18pt'
+p.xaxis.axis_label_text_font_size = '18pt'
 
-df = pd.read_csv(join(dirname(__file__), 'data/2015_weather.csv'))
-source = get_dataset(df, cities[city]['airport'], distribution)
-plot = make_plot(source, "Weather data for " + cities[city]['title'])
 
-city_select.on_change('value', update_plot)
-distribution_select.on_change('value', update_plot)
+def update():
+    print('Slider Value', slider.value)
+    current = optimize_values(df, slider.value)
+    gkp = optimize_values(df[df.source == 'GKP'], slider.value)
+    impressions = current.daily_impressions_average
+    source.data = {'Keyword': current.Keyword,
+                   'ad_position_average': current.ad_position_average,
+                   'cpc_average': current.cpc_average,
+                   'daily_clicks_average': current.daily_clicks_average,
+                   'daily_cost_average': current.daily_cost_average,
+                   'daily_impressions_average': impressions,
+                   'source': current.source
+                   }
+    bar_data[choice[0]] = np.log([gkp[x].sum() for x in metric])
+    bar_data[choice[1]] = np.log([current[x].sum() for x in metric])
+    bar_source.data = bar_data
 
-controls = column(city_select, distribution_select)
 
-curdoc().add_root(row(plot, controls))
-curdoc().title = "Weather"
+slider = Slider(title="Daily budget", start=minimum, end=maximum,
+                value=first_budget, step=0.1, format="0,0")
+slider.on_change('value', lambda attr, old, new: update())
+
+button = Button(label="Download", button_type="success", width=400)
+button.callback = CustomJS(args=dict(source=source),
+                           code=open(join(dirname(__file__), "download.js")
+                                     ).read())
+
+columns = [
+    TableColumn(field="Keyword", title="Keyword"),
+    TableColumn(field="daily_cost_average", title="Cost",
+                formatter=NumberFormatter(format="$0,0.00")),
+    TableColumn(field="ad_position_average", title="Position"),
+    TableColumn(field="daily_clicks_average", title="Clicks"),
+    TableColumn(field="cpc_average", title="CPC"),
+    TableColumn(field="daily_impressions_average", title='Impressions'),
+    TableColumn(field="source", title='Source')
+]
+
+div = Div(text="""<b>Optimized keywords</b>""", width=400, height=20)
+div_missing = Div(text="""<b>Keywords without data</b>""", width=400, height=20
+                  )
+data_table = DataTable(source=source, columns=columns, width=450, height=200)
+
+data_table_nans = DataTable(source=source_missing, columns=columns,
+                            width=450, height=200)
+
+layout = row(column(div, data_table, button, sizing_mode="scale_width"),
+             column(p, sizing_mode="scale_width"))
+curdoc().add_root(slider)
+curdoc().add_root(layout)
+curdoc().add_root(row(column(div_missing, data_table_nans,
+                             sizing_mode="scale_width"),
+                      sizing_mode="scale_width"))
+curdoc().title = "Export CSV"
+
+update()
